@@ -1,0 +1,219 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天执行一次：UTC 18:17 = 北京时间次日 02:17。
+    # GitHub cron 一律按 UTC 计算，要改时间请自行换算（北京时间 = UTC + 8）。
+    # 建议避开整点（:00），GitHub 在整点会有大量任务排队，实际触发可能被延后数十分钟。
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '仅检查上游差异，不推送、不部署'
+        type: boolean
+        default: false
+      force_deploy:
+        description: '即使上游没有新提交，也强制部署一次'
+        type: boolean
+        default: false
+
+# 注意：这里刻意写成固定前缀 sync-upstream-，不使用 github.workflow。
+# 原因是 cloudflare-deploy.yml 被 workflow_call 调用时，其 concurrency 组里的
+# github.workflow 可能解析成调用方（本文件）的名字，若两边同名会互相 cancel。
+concurrency:
+  group: sync-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+# 最小权限：只有 sync job 需要写权限，deploy job 单独声明。
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: https://github.com/mtvpls/MoonTVPlus.git
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    name: 同步上游更新
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 推送同步结果回 fork
+      pull-requests: write # 冲突时创建 PR 通知人工处理
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      head_sha: ${{ steps.sync.outputs.head_sha }}
+      strategy: ${{ steps.sync.outputs.strategy }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 未配置 SYNC_PAT 时自动回退到内置的 GITHUB_TOKEN
+          token: ${{ secrets.SYNC_PAT || github.token }}
+
+      - name: 拉取上游并同步
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_REPO"
+          else
+            git remote add upstream "$UPSTREAM_REPO"
+          fi
+          git fetch upstream "$UPSTREAM_BRANCH" --no-tags --prune
+
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse "refs/remotes/upstream/$UPSTREAM_BRANCH")"
+          BEHIND="$(git rev-list --count "HEAD..refs/remotes/upstream/$UPSTREAM_BRANCH")"
+          AHEAD="$(git rev-list --count "refs/remotes/upstream/$UPSTREAM_BRANCH..HEAD")"
+          SHORT="${UPSTREAM_SHA:0:7}"
+          SYNC_BRANCH="sync/upstream-$SHORT"
+
+          echo "fork HEAD : $LOCAL_SHA"
+          echo "upstream  : $UPSTREAM_SHA"
+          echo "behind=$BEHIND ahead=$AHEAD"
+
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游仓库 | \`$UPSTREAM_REPO\` (\`$UPSTREAM_BRANCH\`) |"
+            echo "| 上游最新提交 | \`$UPSTREAM_SHA\` |"
+            echo "| 同步前 fork HEAD | \`$LOCAL_SHA\` |"
+            echo "| 落后 / 领先上游 | $BEHIND / $AHEAD |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ---- 无新提交：跳过，不浪费 Actions 时长、不做无意义部署 ----
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "::notice::上游没有新提交，跳过同步与部署"
+            {
+              echo ""
+              echo "> 上游没有新提交，本次未推送、未部署。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "head_sha=$LOCAL_SHA" >> "$GITHUB_OUTPUT"
+            echo "strategy=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ---- dry run：只报告 ----
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::dry_run=true，仅检查差异，不推送、不部署"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "head_sha=$LOCAL_SHA" >> "$GITHUB_OUTPUT"
+            echo "strategy=dry-run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$AHEAD" -eq 0 ]; then
+            # ===== 情况 A：fork 没有独有提交，直接快进 =====
+            echo "::group::fast-forward 同步"
+            if ! git push origin "$UPSTREAM_SHA:refs/heads/$FORK_BRANCH"; then
+              echo "::error::推送失败。请检查：1) Settings → Actions → General → Workflow permissions 是否为 Read and write；2) main 分支是否有分支保护规则阻止直接推送。"
+              exit 1
+            fi
+            NEW_SHA="$UPSTREAM_SHA"
+            STRATEGY="fast-forward"
+            echo "::endgroup::"
+          else
+            # ===== 情况 B：fork 有独有提交，走 merge，绝不强推 =====
+            echo "::group::merge 同步（fork 有 $AHEAD 个独有提交）"
+            git checkout -B "$SYNC_BRANCH"
+            if git merge --no-ff --no-edit \
+                -m "chore(sync): merge upstream $SHORT into $FORK_BRANCH" \
+                "refs/remotes/upstream/$UPSTREAM_BRANCH"; then
+              if ! git push origin "HEAD:refs/heads/$FORK_BRANCH"; then
+                echo "::error::合并成功但推送失败。请检查 Workflow permissions 与 main 分支保护规则。"
+                exit 1
+              fi
+              NEW_SHA="$(git rev-parse HEAD)"
+              STRATEGY="merge"
+            else
+              # ===== 情况 C：冲突，中止并开 PR 交给人处理，绝不覆盖用户代码 =====
+              git merge --abort || true
+              echo "::endgroup::"
+              git push --force origin "$UPSTREAM_SHA:refs/heads/$SYNC_BRANCH"
+
+              BODY_FILE="$(mktemp)"
+              printf '%s\n' \
+                "上游 \`$SHORT\` 与 fork 的 \`$FORK_BRANCH\` 发生合并冲突，自动同步已**中止**，" \
+                "不会强推、不会覆盖你自己的改动。" \
+                "" \
+                "本 PR 的 head 分支 \`$SYNC_BRANCH\` 是上游 \`$UPSTREAM_BRANCH\` 的原始快照；冲突前 fork HEAD 为 \`$LOCAL_SHA\`。" \
+                "" \
+                "处理方式（二选一）：" \
+                "" \
+                "1. 在 GitHub 上点 \"Resolve conflicts\" 解决冲突后合并本 PR；" \
+                "2. 本地处理：" \
+                '```bash' \
+                "git fetch upstream $UPSTREAM_BRANCH" \
+                "git checkout $FORK_BRANCH" \
+                "git merge upstream/$UPSTREAM_BRANCH" \
+                "# 解决冲突后：git add -A && git commit" \
+                "git push origin $FORK_BRANCH" \
+                '```' \
+                "" \
+                "合并完成后，如需立刻上线请手动运行 \"Deploy to Cloudflare\"。" \
+                > "$BODY_FILE"
+
+              EXISTING="$(gh pr list --state open --head "$SYNC_BRANCH" --json number --jq '.[0].number // empty' || true)"
+              if [ -z "$EXISTING" ]; then
+                gh pr create \
+                  --base "$FORK_BRANCH" \
+                  --head "$SYNC_BRANCH" \
+                  --title "⚠️ 上游同步冲突，需人工处理 ($SHORT)" \
+                  --body-file "$BODY_FILE"
+              else
+                echo "::notice::冲突 PR 已存在：#$EXISTING"
+              fi
+
+              {
+                echo ""
+                echo "> ❌ 与上游冲突，已创建 PR \`$SYNC_BRANCH\` 等待人工处理，本次未改动 main、未部署。"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::上游同步冲突，已创建 PR 等待人工处理，本次不部署"
+              exit 1
+            fi
+            echo "::endgroup::"
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$NEW_SHA" >> "$GITHUB_OUTPUT"
+          echo "strategy=$STRATEGY" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "同步方式：**$STRATEGY**，fork \`$FORK_BRANCH\` 新 HEAD：\`$NEW_SHA\`"
+            echo ""
+            echo "如需回滚到同步前："
+            echo '```bash'
+            echo "git checkout $FORK_BRANCH"
+            echo "git reset --hard $LOCAL_SHA"
+            echo "git push --force-with-lease origin $FORK_BRANCH"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to Cloudflare
+    needs: sync
+    if: ${{ needs.sync.outputs.changed == 'true' || inputs.force_deploy == true }}
+    # 通过 workflow_call 直接复用部署工作流（而非 gh workflow run / REST dispatch）：
+    # GITHUB_TOKEN 触发的事件无法再触发新的 workflow_dispatch，用 REST 会静默失败。
+    uses: ./.github/workflows/cloudflare-deploy.yml
+    permissions:
+      contents: read
+      deployments: write
+    secrets: inherit
+    with:
+      # 必须显式传 ref：被调用工作流里的 checkout 默认取调用方触发时的 SHA，
+      # 也就是「同步之前」的旧提交，不传会部署旧代码。
+      ref: ${{ needs.sync.outputs.head_sha }}

@@ -2,6 +2,15 @@ name: Deploy to Cloudflare
 
 on:
   workflow_dispatch:
+  # 供 sync-upstream.yml 通过 workflow_call 调用（上游同步成功后自动部署）。
+  # 保留上面的 workflow_dispatch，手动点「Run workflow」的习惯不受影响。
+  workflow_call:
+    inputs:
+      ref:
+        description: '要构建/部署的 git ref（分支名或 commit SHA）。留空则回退到触发事件的默认 ref。'
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,6 +28,11 @@ jobs:
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
+        with:
+          # 被 workflow_call 调用时 github.ref 是调用方的 ref、checkout 默认取的是调用方
+          # 触发时的旧 SHA，所以这里允许调用方传入同步后的新 SHA；手动 dispatch 时
+          # inputs.ref 为空，回退到 github.ref，行为与改动前一致。
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
